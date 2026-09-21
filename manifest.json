@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "毒エロチワワ",
-  "version": "1.0.1",
-  "description": "日本語テキストを毒チワワ / エロチワワの2値モデルでローカル判定するChrome拡張。",
+  "version": "1.2.0",
+  "description": "日本語テキストをローカル判定し、X上のポストをチワワ分類ごとに表示・霧散フィルタするChrome拡張。",
   "permissions": [
     "storage",
     "offscreen",
@@ -35,6 +35,16 @@
         "content.css"
       ],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "assets/stamp-*.webp"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ],
   "content_security_policy": {
