@@ -1,5 +1,5 @@
 (() => {
-  // v1.2.0
+  // v2.1.0
   // This script intentionally supersedes the old jp-offensiveness UI.
   // Old injected listeners from a previously loaded extension can survive
   // until the tab is refreshed, so the old tooltip class is also suppressed
@@ -35,6 +35,7 @@
         scheduleXFilterScan();
       }
     }
+    if (x.accountAnalysisRequest?.newValue) resumeAccountAnalysis();
   });
 
   // Remove UI left by the previous extension implementation.
@@ -58,6 +59,12 @@
   let hoverPoint = null;
   const activeFilterMetas = new Set();
   let lastFilterActivity = performance.now();
+  let accountAnalysisPanel = null;
+  let accountAnalysisRun = 0;
+  let accountAnalysisBusy = false;
+  let accountAnalysisFilterBackup = 'off';
+  let accountAnalysisImageBlob = null;
+  const ACCOUNT_ANALYSIS_GITHUB_URL = 'https://github.com/kokuren333/Doku-Chiwawa-Extension/';
 
   const FILTER_CONCURRENCY = 2;
   const FILTER_TRIGGER_RATIO = 0.6;
@@ -870,6 +877,364 @@
 
     ta.focus();
   }
+
+  function waitForAccountAnalysis(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function accountProfileHandle() {
+    if (!isXPage()) return '';
+    const part = decodeURIComponent(location.pathname.split('/').filter(Boolean)[0] || '').replace(/^@+/, '');
+    return /^[A-Za-z0-9_]{1,15}$/.test(part) ? part : '';
+  }
+
+  function accountAnalysisUrlHandle() {
+    if (!isXPage()) return '';
+    const params = new URLSearchParams(location.search);
+    if (params.get('cw_chiwawa_analysis') !== '1') return '';
+    const handle = String(params.get('cw_handle') || '').replace(/^@+/, '');
+    return /^[A-Za-z0-9_]{1,15}$/.test(handle) ? handle : '';
+  }
+
+  function clearAccountAnalysisUrlFlag() {
+    try {
+      const url = new URL(location.href);
+      url.searchParams.delete('cw_chiwawa_analysis');
+      url.searchParams.delete('cw_handle');
+      history.replaceState(history.state, document.title, `${url.pathname}${url.search}${url.hash}`);
+    } catch {
+      // The storage request remains the fallback if X blocks history replacement.
+    }
+  }
+
+  function accountStatusId(article) {
+    for (const link of article.querySelectorAll('a[href*="/status/"]')) {
+      const match = link.getAttribute('href')?.match(/\/status\/(\d+)/);
+      if (match) return match[1];
+    }
+    return '';
+  }
+
+  function accountAuthorHandle(article) {
+    const link = article.querySelector('[data-testid="User-Name"] a[href^="/"]');
+    if (!link) return '';
+    return (link.getAttribute('href') || '').split('/').filter(Boolean)[0]?.replace(/^@+/, '') || '';
+  }
+
+  function accountAnalysisText(article) {
+    return tweetText(article) || 'メディアのみの投稿';
+  }
+
+  function collectVisibleAccountTweets(handle, tweets) {
+    document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => {
+      if (article.parentElement?.closest('article[data-testid="tweet"]')) return;
+      const author = accountAuthorHandle(article);
+      if (author && author.toLowerCase() !== handle.toLowerCase()) return;
+      const statusId = accountStatusId(article);
+      const text = accountAnalysisText(article);
+      if (!text) return;
+      const key = statusId || `${author}:${text.slice(0, 180)}`;
+      if (!tweets.has(key)) tweets.set(key, { key, statusId, text, author });
+    });
+  }
+
+  function setAccountAnalysisStatus(text) {
+    accountAnalysisPanel?.querySelector('.cw-account-analysis-progress')?.replaceChildren(document.createTextNode(text));
+  }
+
+  async function collectAccountTweets(handle, run) {
+    const tweets = new Map();
+    let stalled = 0;
+    let lastCount = 0;
+    window.scrollTo({ top: 0, behavior: 'auto' });
+    await waitForAccountAnalysis(850);
+
+    for (let round = 0; round < 90 && run === accountAnalysisRun && tweets.size < 100; round += 1) {
+      collectVisibleAccountTweets(handle, tweets);
+      setAccountAnalysisStatus(`投稿を収集中… ${Math.min(100, tweets.size)} / 100`);
+      if (tweets.size >= 100) break;
+
+      if (tweets.size === lastCount) stalled += 1;
+      else stalled = 0;
+      lastCount = tweets.size;
+      if (stalled >= 12 && round >= 15) break;
+
+      window.scrollBy({ top: Math.max(480, Math.floor(window.innerHeight * 0.82)), behavior: 'smooth' });
+      await waitForAccountAnalysis(720 + (round % 3) * 160);
+    }
+
+    return [...tweets.values()].slice(0, 100);
+  }
+
+  function accountPercentile(values, fraction) {
+    if (!values.length) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(fraction * sorted.length) - 1));
+    return sorted[index];
+  }
+
+  function accountAggregate(values) {
+    const n = values.length;
+    if (!n) return { n: 0, mean: 0, p90: 0, maximum: 0, highRate: 0, index: 0, histogram: Array(10).fill(0) };
+    const mean = values.reduce((sum, value) => sum + value, 0) / n;
+    const p90 = accountPercentile(values, 0.90);
+    const highRate = values.filter((value) => value >= 0.70).length / n;
+    const histogram = Array(10).fill(0);
+    values.forEach((value) => histogram[Math.min(9, Math.floor(value * 10))] += 1);
+    return {
+      n,
+      mean,
+      p90,
+      maximum: Math.max(...values),
+      highRate,
+      index: Math.min(1, 0.50 * mean + 0.25 * p90 + 0.25 * highRate),
+      histogram,
+    };
+  }
+
+  async function scoreAccountTweets(tweets, run) {
+    const scored = [];
+    let next = 0;
+    let completed = 0;
+    const worker = async () => {
+      while (next < tweets.length && run === accountAnalysisRun) {
+        const index = next++;
+        const tweet = tweets[index];
+        try {
+          const result = await infer(tweet.text);
+          scored[index] = { ...tweet, doku: Number(result.doku_score) || 0, ero: Number(result.ero_score) || 0 };
+        } catch {
+          scored[index] = null;
+        }
+        completed += 1;
+        setAccountAnalysisStatus(`投稿を判定中… ${completed} / ${tweets.length}`);
+      }
+    };
+    await Promise.all([worker(), worker()]);
+    return scored.filter(Boolean);
+  }
+
+  function roundAnalysisRect(ctx, x, y, width, height, radius) {
+    const r = Math.min(radius, width / 2, height / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + width, y, x + width, y + height, r);
+    ctx.arcTo(x + width, y + height, x, y + height, r);
+    ctx.arcTo(x, y + height, x, y, r);
+    ctx.arcTo(x, y, x + width, y, r);
+    ctx.closePath();
+  }
+
+  function drawAnalysisHistogram(ctx, title, values, x, y, width, color) {
+    const max = Math.max(1, ...values);
+    ctx.fillStyle = '#cfd0da';
+    ctx.font = '700 25px sans-serif';
+    ctx.fillText(title, x, y);
+    const baseY = y + 205;
+    const barWidth = (width - 30) / 10;
+    ctx.strokeStyle = '#454655';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x, baseY + 1);
+    ctx.lineTo(x + width, baseY + 1);
+    ctx.stroke();
+    values.forEach((count, index) => {
+      const barHeight = count ? Math.max(5, (count / max) * 155) : 0;
+      const barX = x + index * barWidth + 2;
+      ctx.fillStyle = color;
+      ctx.fillRect(barX, baseY - barHeight, Math.max(5, barWidth - 6), barHeight);
+      ctx.fillStyle = '#a6a7b2';
+      ctx.font = '18px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText((index / 10).toFixed(1), barX + (barWidth - 6) / 2, baseY + 28);
+      if (count) {
+        ctx.fillStyle = '#fff';
+        ctx.font = '700 16px sans-serif';
+        ctx.fillText(String(count), barX + (barWidth - 6) / 2, baseY - barHeight - 8);
+      }
+    });
+    ctx.textAlign = 'left';
+  }
+
+  async function makeAccountAnalysisImage(summary) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1200;
+    canvas.height = 950;
+    const ctx = canvas.getContext('2d');
+    const background = ctx.createLinearGradient(0, 0, 1200, 950);
+    background.addColorStop(0, '#171322');
+    background.addColorStop(1, '#101117');
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 44px sans-serif';
+    ctx.fillText(`@${summary.handle}さんのチワワ指数`, 58, 76);
+    ctx.fillStyle = '#a9a6b8';
+    ctx.font = '22px sans-serif';
+    ctx.fillText(`直近${summary.n}件 / 毒・エロの観測スコア`, 60, 114);
+
+    const scoreY = 154;
+    const scoreWidth = 510;
+    const scoreBoxes = [
+      { label: '毒指数', value: summary.doku.index, color: '#b56cff', x: 60 },
+      { label: 'エロ指数', value: summary.ero.index, color: '#ff63b8', x: 630 },
+    ];
+    scoreBoxes.forEach((box) => {
+      roundAnalysisRect(ctx, box.x, scoreY, scoreWidth, 142, 22);
+      ctx.fillStyle = '#24212f';
+      ctx.fill();
+      ctx.fillStyle = box.color;
+      ctx.font = '700 25px sans-serif';
+      ctx.fillText(box.label, box.x + 28, scoreY + 42);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '800 62px sans-serif';
+      ctx.fillText(`${(box.value * 100).toFixed(1)}%`, box.x + 28, scoreY + 108);
+    });
+
+    drawAnalysisHistogram(ctx, '毒スコア分布', summary.doku.histogram, 60, 360, 510, '#9f62e7');
+    drawAnalysisHistogram(ctx, 'エロスコア分布', summary.ero.histogram, 630, 360, 510, '#e85aab');
+
+    ctx.fillStyle = '#b7b8c3';
+    ctx.font = '20px sans-serif';
+    ctx.fillText(`平均  毒 ${(summary.doku.mean * 100).toFixed(1)}% / エロ ${(summary.ero.mean * 100).toFixed(1)}%`, 60, 660);
+    ctx.fillText(`p90  毒 ${(summary.doku.p90 * 100).toFixed(1)}% / エロ ${(summary.ero.p90 * 100).toFixed(1)}%`, 60, 696);
+    ctx.fillText(`高スコア率(70%以上)  毒 ${(summary.doku.highRate * 100).toFixed(1)}% / エロ ${(summary.ero.highRate * 100).toFixed(1)}%`, 60, 732);
+    ctx.fillStyle = '#7f8090';
+    ctx.font = '17px sans-serif';
+    ctx.fillText('※モデルが投稿文・メディア説明から算出した実験的な観測指標です。人格や危険性の判定ではありません。', 60, 810);
+    ctx.fillText('毒エロチワワ · Doku / Ero dual binary', 60, 850);
+
+    return {
+      dataUrl: canvas.toDataURL('image/png'),
+      blob: await new Promise((resolve) => canvas.toBlob(resolve, 'image/png')),
+    };
+  }
+
+  function analysisSummaryHTML(summary) {
+    const score = (value) => `${(value * 100).toFixed(1)}%`;
+    return `<div class="cw-account-analysis-summary"><div><span class="cw-analysis-doku">毒指数</span><strong>${score(summary.doku.index)}</strong></div><div><span class="cw-analysis-ero">エロ指数</span><strong>${score(summary.ero.index)}</strong></div></div><div class="cw-account-analysis-note">平均 / p90 / 高スコア率を、平均重視の集約式（50% / 25% / 25%）で合成</div>`;
+  }
+
+  function ensureAccountAnalysisPanel() {
+    if (accountAnalysisPanel?.isConnected) return accountAnalysisPanel;
+    accountAnalysisPanel = document.createElement('section');
+    accountAnalysisPanel.className = 'cw-account-analysis';
+    accountAnalysisPanel.innerHTML = `<div class="cw-account-analysis-head"><strong>アカウント分析</strong><button class="cw-account-analysis-close" aria-label="閉じる">×</button></div><div class="cw-account-analysis-progress">準備中…</div><div class="cw-account-analysis-result" hidden><div class="cw-account-analysis-summary-slot"></div><img class="cw-account-analysis-image" alt="アカウントのチワワ指数カード"><div class="cw-account-analysis-actions"><button class="cw-account-analysis-copy-image">画像をコピー</button><button class="cw-account-analysis-copy-text">文面をコピー</button></div></div>`;
+    document.documentElement.appendChild(accountAnalysisPanel);
+    accountAnalysisPanel.querySelector('.cw-account-analysis-close').onclick = () => {
+      accountAnalysisRun += 1;
+      accountAnalysisBusy = false;
+      if (accountAnalysisFilterBackup !== 'off') {
+        xFilterMode = accountAnalysisFilterBackup;
+        accountAnalysisFilterBackup = 'off';
+        lastFilterActivity = performance.now();
+        startXFilterObserver();
+        scheduleXFilterScan();
+      }
+      accountAnalysisPanel.remove();
+      accountAnalysisPanel = null;
+    };
+    accountAnalysisPanel.querySelector('.cw-account-analysis-copy-image').onclick = () => copyAccountAnalysisImage();
+    accountAnalysisPanel.querySelector('.cw-account-analysis-copy-text').onclick = () => copyAccountAnalysisText();
+    return accountAnalysisPanel;
+  }
+
+  function accountAnalysisShareText(summary) {
+    return `@${summary.handle}さんのチワワ指数\n毒 ${(summary.doku.index * 100).toFixed(1)}% / エロ ${(summary.ero.index * 100).toFixed(1)}%\n直近${summary.n}件を分析しました。\n\n${ACCOUNT_ANALYSIS_GITHUB_URL}`;
+  }
+
+  async function copyAccountAnalysisImage() {
+    const summary = accountAnalysisPanel?.__cwSummary;
+    if (!summary) return;
+    if (!accountAnalysisImageBlob || !navigator.clipboard?.write || !window.ClipboardItem) {
+      setAccountAnalysisStatus('画像をコピーできません。このブラウザではクリップボード画像に対応していません。');
+      return;
+    }
+    try {
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': accountAnalysisImageBlob })]);
+      setAccountAnalysisStatus('カード画像をコピーしました。Xの投稿欄で貼り付けてください。');
+    } catch {
+      setAccountAnalysisStatus('画像をコピーできませんでした。ページのクリップボード権限を確認してください。');
+    }
+  }
+
+  async function copyAccountAnalysisText() {
+    const summary = accountAnalysisPanel?.__cwSummary;
+    if (!summary) return;
+    const text = accountAnalysisShareText(summary);
+    try {
+      await navigator.clipboard.writeText(text);
+      setAccountAnalysisStatus('結果文面とGitHubリンクをコピーしました。Xの投稿欄で貼り付けてください。');
+    } catch {
+      setAccountAnalysisStatus('文面をコピーできませんでした。ページのクリップボード権限を確認してください。');
+    }
+  }
+
+  async function startAccountAnalysis(handle) {
+    if (!handle || !isXPage() || accountAnalysisBusy) return;
+    accountAnalysisBusy = true;
+    const run = ++accountAnalysisRun;
+    const panel = ensureAccountAnalysisPanel();
+    panel.hidden = false;
+    panel.__cwSummary = null;
+    panel.querySelector('.cw-account-analysis-result').hidden = true;
+    setAccountAnalysisStatus(`@${handle} のページを準備中…`);
+    clearAccountAnalysisUrlFlag();
+    await chrome.storage.local.remove('accountAnalysisRequest');
+
+    const previousFilterMode = xFilterMode;
+    accountAnalysisFilterBackup = previousFilterMode;
+    if (previousFilterMode !== 'off') {
+      xFilterMode = 'off';
+      clearXFilter();
+    }
+
+    try {
+      const tweets = await collectAccountTweets(handle, run);
+      if (run !== accountAnalysisRun) return;
+      if (!tweets.length) throw new Error('投稿を取得できませんでした');
+      const scored = await scoreAccountTweets(tweets, run);
+      if (run !== accountAnalysisRun) return;
+      if (!scored.length) throw new Error('投稿の判定に失敗しました');
+
+      const summary = { handle, n: scored.length, doku: accountAggregate(scored.map((tweet) => tweet.doku)), ero: accountAggregate(scored.map((tweet) => tweet.ero)) };
+      const image = await makeAccountAnalysisImage(summary);
+      accountAnalysisImageBlob = image.blob;
+      panel.__cwSummary = summary;
+      panel.querySelector('.cw-account-analysis-summary-slot').innerHTML = analysisSummaryHTML(summary);
+      panel.querySelector('.cw-account-analysis-image').src = image.dataUrl;
+      panel.querySelector('.cw-account-analysis-result').hidden = false;
+      setAccountAnalysisStatus(`分析完了：${scored.length}件（取得 ${tweets.length}件）`);
+    } catch (error) {
+      if (run === accountAnalysisRun) setAccountAnalysisStatus(`分析できませんでした：${error?.message || '不明なエラー'}`);
+    } finally {
+      if (run === accountAnalysisRun && previousFilterMode !== 'off') {
+        xFilterMode = previousFilterMode;
+        accountAnalysisFilterBackup = 'off';
+        lastFilterActivity = performance.now();
+        startXFilterObserver();
+        scheduleXFilterScan();
+      }
+      if (run === accountAnalysisRun) accountAnalysisBusy = false;
+    }
+  }
+
+  async function resumeAccountAnalysis() {
+    if (!isXPage() || accountAnalysisBusy) return;
+    const urlHandle = accountAnalysisUrlHandle();
+    if (urlHandle && accountProfileHandle().toLowerCase() === urlHandle.toLowerCase()) {
+      startAccountAnalysis(urlHandle);
+      return;
+    }
+    const stored = await chrome.storage.local.get({ accountAnalysisRequest: null });
+    const request = stored.accountAnalysisRequest;
+    if (!request?.handle || !request.createdAt || Date.now() - request.createdAt > 10 * 60 * 1000) return;
+    if (accountProfileHandle().toLowerCase() !== String(request.handle).toLowerCase()) return;
+    startAccountAnalysis(String(request.handle));
+  }
+
+  setTimeout(resumeAccountAnalysis, 700);
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg?.type === 'OPEN_COMPOSE') {

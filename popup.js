@@ -1,8 +1,12 @@
 const $=s=>document.querySelector(s);const status=$('#status'),hover=$('#hover'),selection=$('#selection');
 const filter=$('#xFilterMode');
+const accountName=$('#accountName'),analyzeAccount=$('#analyzeAccount');
 async function refresh(){const x=await chrome.storage.local.get({hoverEnabled:true,selectionEnabled:true,xFilterMode:'off'});hover.checked=x.hoverEnabled;selection.checked=x.selectionEnabled;filter.value=x.xFilterMode||'off';try{const s=await chrome.runtime.sendMessage({type:'GET_STATUS'});status.textContent=s?.state?.error?`${s.state.detail}: ${s.state.error}`:s?.state?.detail||s?.error||'未初期化'}catch{status.textContent='未初期化'}}
 hover.onchange=()=>chrome.storage.local.set({hoverEnabled:hover.checked});selection.onchange=()=>chrome.storage.local.set({selectionEnabled:selection.checked});
 filter.onchange=()=>chrome.storage.local.set({xFilterMode:filter.value});
 $('#prepare').onclick=async()=>{status.textContent='準備中…';const r=await chrome.runtime.sendMessage({type:'PREPARE_MODEL'});status.textContent=r?.state?.detail||r?.error||'完了'};
 $('#compose').onclick=async()=>{const [tab]=await chrome.tabs.query({active:true,currentWindow:true});const r=await chrome.runtime.sendMessage({type:'OPEN_COMPOSE',tabId:tab?.id});if(!r?.ok){status.textContent=r?.error||'開けませんでした';return}window.close()};
-$('#clear').onclick=async()=>{const r=await chrome.runtime.sendMessage({type:'CLEAR_MODEL_CACHE'});status.textContent=r?.state?.detail||r?.error||'削除済み'};refresh();
+$('#clear').onclick=async()=>{const r=await chrome.runtime.sendMessage({type:'CLEAR_MODEL_CACHE'});status.textContent=r?.state?.detail||r?.error||'削除済み'};
+function normalizeAccountName(value){let x=String(value||'').trim();if(!x)return'';try{if(/^https?:\/\/(www\.)?(x\.com|twitter\.com)\//i.test(x)){x=new URL(x).pathname.split('/').filter(Boolean)[0]||''}}catch{}x=x.replace(/^@+/,'').split(/[/?#\s]/)[0];return/^[A-Za-z0-9_]{1,15}$/.test(x)?x:''}
+async function startAccountAnalysis(){const handle=normalizeAccountName(accountName.value);if(!handle){status.textContent='@username の形式で入力してください';accountName.focus();return}const [tab]=await chrome.tabs.query({active:true,currentWindow:true});if(!tab?.id){status.textContent='Xのタブを開いてください';return}status.textContent=`@${handle} の分析を開始します…`;await chrome.storage.local.set({accountAnalysisRequest:{handle,requestId:`${Date.now()}-${Math.random().toString(36).slice(2)}`,createdAt:Date.now()}});const url=`https://x.com/${encodeURIComponent(handle)}?cw_chiwawa_analysis=1&cw_handle=${encodeURIComponent(handle)}`;await chrome.tabs.update(tab.id,{url});window.close()}
+analyzeAccount.onclick=startAccountAnalysis;accountName.addEventListener('keydown',e=>{if(e.key==='Enter')startAccountAnalysis()});refresh();
