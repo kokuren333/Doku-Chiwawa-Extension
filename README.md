@@ -15,6 +15,12 @@
 
 投稿前チェックだけは、判定に加えて **毒 raw / エロ raw** を表示します。
 
+## ストア掲載用スクリーンショット
+
+Chrome Web Storeの掲載要件に合わせた1280×800・24ビットPNGです。
+
+![X上で毒チワワの分類スタンプを表示している画面](assets/store-screenshot-dokuchiwawa-1280x800.png)
+
 ## 判定モデル
 
 1つの DeBERTa-v2 small から2つの独立logitを出す dual-binary モデルです。
