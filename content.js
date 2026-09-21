@@ -61,11 +61,11 @@
 
   const FILTER_CONCURRENCY = 2;
   const FILTER_TRIGGER_RATIO = 0.6;
-  const FILTER_DISPLAY_DELAY = 700;
+  const FILTER_DISPLAY_DELAY = 180;
   const FILTER_IDLE_TIMEOUT = 6500;
   const FILTER_BATCH_LIMIT = 6;
   const FILTER_MAX_PENDING = 10;
-  const FILTER_SCAN_DEBOUNCE = 180;
+  const FILTER_SCAN_DEBOUNCE = 80;
   const FILTER_STAMP_ASSETS = {
     plain: 'assets/stamp-chiwawa.webp',
     doku: 'assets/stamp-doku-chiwawa.webp',
@@ -296,12 +296,49 @@
   );
 
   function tweetText(article) {
+    const parts = [];
     const nodes = [...article.querySelectorAll('[data-testid="tweetText"]')];
     for (const node of nodes) {
-      const text = node.innerText?.trim();
-      if (text) return text;
+      const text = node.innerText?.replace(/\s+/g, ' ').trim();
+      if (text) parts.push(text);
+      if (parts.length) break;
     }
-    return '';
+
+    const genericMediaLabels = new Set([
+      '画像', '写真', 'イメージ', '動画', '映像', '画像1', '画像 1',
+      'image', 'photo', 'video', 'media', 'gif', 'animated gif',
+    ]);
+    const mediaRoots = [
+      ...article.querySelectorAll(
+        '[data-testid="tweetPhoto"], [data-testid="videoPlayer"], [data-testid="card.layoutLarge.media"]'
+      ),
+    ];
+
+    for (const root of mediaRoots) {
+      const candidates = [
+        root.getAttribute('aria-label'),
+        root.getAttribute('title'),
+        root.querySelector('img[alt]')?.getAttribute('alt'),
+      ];
+      const description = candidates
+        .map((value) => value?.replace(/\s+/g, ' ').trim())
+        .find((value) => value && !genericMediaLabels.has(value.toLowerCase()));
+      if (description) parts.push(`メディア説明: ${description}`);
+    }
+
+    // Some X layouts expose image alt text without tweetPhoto on the wrapper.
+    if (!mediaRoots.length) {
+      for (const image of article.querySelectorAll('img[alt]')) {
+        if (image.closest('[data-testid="Tweet-User-Avatar"]')) continue;
+        if (!image.src.includes('pbs.twimg.com/media')) continue;
+        const alt = image.alt?.replace(/\s+/g, ' ').trim();
+        if (alt && !genericMediaLabels.has(alt.toLowerCase())) {
+          parts.push(`メディア説明: ${alt}`);
+        }
+      }
+    }
+
+    return parts.join('\n').trim();
   }
 
   function isXPage() {
@@ -324,10 +361,15 @@
     clearTimeout(meta.hideTimer);
     clearTimeout(meta.queueTimer);
     clearTimeout(meta.settleTimer);
+    clearTimeout(meta.localizeTimer);
     meta.stamp?.remove();
     meta.crack?.remove();
+    if (meta.stampHost && meta.hostPositionChanged && meta.stampHost.isConnected) {
+      meta.stampHost.style.position = meta.hostInlinePosition;
+    }
     meta.stamp = null;
     meta.crack = null;
+    meta.stampHost = null;
     activeFilterMetas.delete(meta);
   }
 
@@ -365,7 +407,7 @@
     stamp.style.width = `${rect.width}px`;
     stamp.style.height = `${rect.height}px`;
     stamp.innerHTML = `<img class="cw-filter-stamp-image" src="${chrome.runtime.getURL(FILTER_STAMP_ASSETS[result.code])}" alt="${result.label}">`;
-    document.documentElement.appendChild(stamp);
+    (document.body || document.documentElement).appendChild(stamp);
     return stamp;
   }
 
@@ -379,7 +421,7 @@
     crack.style.top = `${rect.top}px`;
     crack.style.width = `${rect.width}px`;
     crack.style.height = `${rect.height}px`;
-    document.documentElement.appendChild(crack);
+    (document.body || document.documentElement).appendChild(crack);
     return crack;
   }
 
@@ -413,15 +455,44 @@
       stamp.style.top = `${next.top}px`;
       stamp.style.width = `${next.width}px`;
       stamp.style.height = `${next.height}px`;
+      meta.localizeTimer = setTimeout(() => attachStampToAvatar(meta), 450);
     });
     return true;
   }
 
+  function attachStampToAvatar(meta) {
+    const stamp = meta?.stamp;
+    const article = meta?.article;
+    const avatar = article?.querySelector('[data-testid="Tweet-User-Avatar"]');
+    const host = avatar?.parentElement || avatar;
+    if (!stamp || !avatar || !host || !article.isConnected) return;
+
+    const avatarBox = avatar.getBoundingClientRect();
+    const hostBox = host.getBoundingClientRect();
+    if (!avatarBox.width || !avatarBox.height || !hostBox.width || !hostBox.height) return;
+
+    meta.stampHost = host;
+    if (getComputedStyle(host).position === 'static') {
+      meta.hostInlinePosition = host.style.position;
+      meta.hostPositionChanged = true;
+      host.style.position = 'relative';
+    }
+
+    stamp.classList.add('cw-filter-stamp-following', 'cw-filter-stamp-local');
+    stamp.style.position = 'absolute';
+    stamp.style.left = `${avatarBox.left - hostBox.left}px`;
+    stamp.style.top = `${avatarBox.top - hostBox.top}px`;
+    stamp.style.width = `${avatarBox.width}px`;
+    stamp.style.height = `${avatarBox.height}px`;
+    host.appendChild(stamp);
+  }
+
   function updateSettledStamps() {
     activeFilterMetas.forEach((meta) => {
-      if (meta.state !== 'visible' || !meta.stamp) return;
+      if (meta.state !== 'visible' || !meta.stamp || meta.stampHost) return;
       const rect = avatarRect(meta.article);
       if (!rect) return;
+      meta.stamp.classList.add('cw-filter-stamp-following');
       meta.stamp.style.left = `${rect.left}px`;
       meta.stamp.style.top = `${rect.top}px`;
       meta.stamp.style.width = `${rect.width}px`;
@@ -468,27 +539,17 @@
       return;
     }
 
-    current.state = 'vanishing';
-
-    current.shatterTimer = setTimeout(() => {
-      if (!isCurrentFilter(article, text, mode, serial)) {
-        cleanupFilterEffect(current);
-        return;
-      }
-      current.crack = createFilterCrack(article);
-      article.classList.add('cw-filter-shatter');
-    }, 480);
-
+    // Hidden posts share the same front-layer stamp press, then disappear
+    // without the heavier crack/shatter animation.
     current.hideTimer = setTimeout(() => {
       if (!isCurrentFilter(article, text, mode, serial)) {
         cleanupFilterEffect(current);
         return;
       }
-      article.classList.remove('cw-filter-shatter');
       article.classList.add('cw-filter-hidden');
       cleanupFilterEffect(current);
       current.state = 'hidden';
-    }, 940);
+    }, 480);
   }
 
   function pumpFilterQueue() {
